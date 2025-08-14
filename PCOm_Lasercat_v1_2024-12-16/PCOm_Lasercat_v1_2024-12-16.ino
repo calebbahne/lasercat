@@ -1,0 +1,1334 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <AccelStepper.h>
+#include <MultiStepper.h>
+#include <EEPROM.h>
+#include <pitches.h>
+#include <math.h>
+
+// Initialize the LCD
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Buzzer Definition
+#define SpeakerPin 12
+bool clickable = false;  // Change this variable to test the sounds
+#define laserPin 11
+
+// Joystick Definitions
+#define joyButton 13  // Joystick button
+#define joyXpin A3    // Joystick X axis
+#define joyYpin A2    // Joystick Y axis
+
+// Stepper motor pins
+#define xDirPin 2
+#define xStepPin 3
+#define SleepPin 4
+
+#define yDirPin 5
+#define yStepPin 6
+#define microstepPin 7
+
+// IR Sensors
+#define xIR_anaPin A0
+#define yIR_anaPin A1
+
+// LCD Variables - Menu Options stored in PROGMEM
+const char menuOptions[][20] PROGMEM = {
+  "< Random  Path >",
+  "<     Quiet    >",
+  "<    Sleep     >",
+  "<Set Boundaries>",
+  "<   Schedule   >",
+  "< Custom  Path >",
+  "<     Demo     >"
+};
+
+const int numOptions = sizeof(menuOptions) / sizeof(menuOptions[0]);
+int currentOption = 0;
+
+
+// Position
+int xPosRange[2] = { -140, 80 };
+int yPosRange[2] = { -90, 60 };  //- is up
+long xyPos[2] = { 0, 0 };        // Stores the positions [x,y] for the two motors
+int xCenterPos = 0;
+int yCenterPos = 0;
+
+// Variables to store the saved stepper positions (4 points)
+long savedPositions[4][2];  // Array to store 4 positions: [0] = X, [1] = Y
+int pressCount = 0;         // Count of button presses
+
+float tempMaxSpeed = 600;
+
+AccelStepper xStepper(AccelStepper::DRIVER, xStepPin, xDirPin);
+AccelStepper yStepper(AccelStepper::DRIVER, yStepPin, yDirPin);
+MultiStepper bothSteppers;
+
+// States
+#define DISPLAY_TITLE 0
+#define SELECT_MODE 1
+#define EXECUTE_MODE 2
+#define LOW_POWER 3
+int currentState = DISPLAY_TITLE;
+
+// Current Mode
+int selectedMode = -1;
+
+// Timing Variables
+unsigned long lastActivity = 0;
+unsigned long titleStartTime = 0;
+unsigned long progressStartTime = 0;
+
+float speedAmplitude; // Amplitude for the fluctuation
+float speedOffset;    // Center offset for speed
+
+// Constants
+#define INACTIVITY_TIMEOUT 10000UL  // 30 sec
+#define PROGRESS_INTERVAL 250UL     // 250ms
+
+// Flags
+bool lcdOn = true;
+
+// Debounce Variables
+bool joystickBusy = false;
+unsigned long lastDebounce = 0;
+#define DEBOUNCE_DELAY 200UL
+
+// Flag to ensure joystick returns to neutral before next input
+bool joystickNeutral = true;
+
+struct Point {
+  float x;
+  float y;
+};
+
+//======Path Stuff
+// Variables to hold the current target and center points
+Point currentTarget;  // Current target point for the segment
+Point currentCenter;  // Current center point for the segment
+Point startPosition;  // Starting position for the path
+
+// Function Prototypes
+void generatePath(int segAmt, int numCurvPts, int numStrtPts, int baseSpeed, int stopTime, Point* start = nullptr);  // Generate the path based on a starting point
+void transmitData(const Point& start, const Point& target, const Point& center, const Point& nextTarget);        // Transmit generated data via Serial
+Point generateRandomPoint();                                                                                     // Generate a random point within defined bounds
+void generateStraightLine(const Point& start, const Point& end, int numPoints);                                  // Generate points for a straight line
+void generateCurve(const Point& start, const Point& end, const Point& control, int numPoints);                   // Generate points for a curve
+
+void generatePolygonPoints(int numSides, int radius, Point* points);
+bool drawRegularPolygon(int numSides, int baseSpeed, unsigned long endTime);
+void demonstrateShapes(int startSides, int duration);
+void drawSquareSpiral(int numSquares, int sf, bool spiral);
+void drawCircleSpiral(long numCircles, int sf, bool spiral);
+
+// Function Prototypes
+void displayMenu();
+String getJoystickDirection();
+bool isButtonReleased();
+void executeSelectedMode();
+void returnToMenu();
+void enterLowPowerMode();
+void exitLowPowerMode();
+void buzzer(bool isClickable);  // Prototype for the buzzer function
+void displayCatSelection();
+bool homeSteppers(int homeSpeed = 100);
+
+// Mode Functions
+bool randomPathMode(int runTime = 1);
+bool demoMode();
+bool sleepMode();
+bool quietMode();
+bool customPathMode();
+bool setBoundaries();
+bool scheduleMode();
+
+// Helper functions placed here...
+
+void setup() {
+  lcd.init();
+  lcd.backlight();
+
+  //====== Stepper and Joystick setup
+  xStepper.setMaxSpeed(1200);
+  yStepper.setMaxSpeed(1200);
+
+  pinMode(SleepPin, OUTPUT);
+  pinMode(microstepPin, OUTPUT);
+  digitalWrite(SleepPin, LOW);       // Active low: sleeps when set to low
+  digitalWrite(microstepPin, HIGH);  // High for 1/16, low for 1/2 microstepping
+
+  bothSteppers.addStepper(xStepper);
+  bothSteppers.addStepper(yStepper);
+
+  pinMode(joyButton, INPUT_PULLUP);
+
+  pinMode(xIR_anaPin, INPUT);
+  pinMode(yIR_anaPin, INPUT);
+
+  pinMode(laserPin, OUTPUT);
+  digitalWrite(laserPin, LOW);
+
+  homeSteppers(800);
+  //moveSteppers(50,50);
+  homeSteppers();
+
+  titleStartTime = millis();
+  lastActivity = millis();
+  progressStartTime = millis();
+
+  randomSeed(millis());
+}
+
+void loop() {  // Main state machine
+  unsigned long currentMillis = millis();
+
+  switch (currentState) {
+    case DISPLAY_TITLE:
+      if (currentMillis - titleStartTime >= 100) {
+        currentState = SELECT_MODE;
+        displayMenu();
+        lastActivity = currentMillis;
+      }
+      break;
+
+    case SELECT_MODE:
+      // Check inactivity
+      if (currentMillis - lastActivity >= INACTIVITY_TIMEOUT) {
+        clickable = true;
+        enterLowPowerMode();
+      } else {
+        // Handle joystick input
+        String direction = getJoystickDirection();
+        if (direction != "Neutral" && joystickNeutral) {  // Only process if neutral
+          lastActivity = currentMillis;
+          if (direction == "Left") {
+            currentOption = (currentOption + 1) % numOptions;
+            clickable = true;
+            if (!isQuietModeActivated()) {
+              tone(SpeakerPin, 1200, 100);
+            }
+            displayMenu();
+            joystickNeutral = false;
+          } else if (direction == "Right") {
+            currentOption = (currentOption - 1 + numOptions) % numOptions;
+            clickable = true;
+            if (!isQuietModeActivated()) {
+              tone(SpeakerPin, 1200, 100);
+            }
+            displayMenu();
+            joystickNeutral = false;
+          }
+        }
+
+        // Check button release
+        if (isButtonReleased()) {
+          selectedMode = currentOption;
+          currentState = EXECUTE_MODE;
+          lastActivity = currentMillis;
+          executeSelectedMode();
+        }
+
+        // Check if joystick has returned to neutral
+        int x = analogRead(joyXpin);
+        int y = analogRead(joyYpin);
+        if (x >= 250 && x <= 750 && y >= 250 && y <= 750) {
+          joystickNeutral = true;
+        }
+      }
+      break;
+
+    case EXECUTE_MODE:
+      // Mode functions handle their own logic
+      // Might not need this
+      break;
+
+    case LOW_POWER:
+      // Wait for any input to wake up
+      if (getJoystickDirection() != "Neutral" || isButtonReleased()) {
+        exitLowPowerMode();
+        currentState = SELECT_MODE;
+        homeSteppers(800);
+        //moveSteppers(50,50);
+        homeSteppers();
+        displayMenu();
+        lastActivity = millis();
+      }
+      break;
+  }
+}
+
+// Function Definitions
+
+void displayMenu() {
+  clickable = true;
+  lcd.clear();
+  lcd.setCursor((16 - strlen_P(PSTR("Select Mode"))) / 2, 0);
+  lcd.print(F("Select Mode"));
+
+  // Display current option
+  lcd.setCursor(0, 1);
+  char buffer[20];
+  strcpy_P(buffer, menuOptions[currentOption]);
+  lcd.print(buffer);  // This is a cool way of doing it
+}
+
+String getJoystickDirection() {
+  String dir = "Neutral";
+  int x = analogRead(joyXpin);
+  int y = analogRead(joyYpin);
+
+  // Thresholds (adjust as needed)
+  if (!joystickBusy) {
+    if (x < 250) {
+      dir = "Right";  //left
+      joystickBusy = true;
+      lastDebounce = millis();
+    } else if (x > 750) {
+      dir = "Left";  //right
+      joystickBusy = true;
+      lastDebounce = millis();
+    } else if (y < 250) {
+      dir = "Down";  // up
+      joystickBusy = true;
+      lastDebounce = millis();
+    } else if (y > 750) {
+      dir = "Up";  //down
+      joystickBusy = true;
+      lastDebounce = millis();
+    }
+  } else {
+    if (millis() - lastDebounce >= DEBOUNCE_DELAY) {
+      joystickBusy = false;
+    }
+  }
+
+  return dir;
+}
+
+// Detect button release
+bool isButtonReleased() {
+  static bool lastState = HIGH;  // set to high the first time but retains its value everytime after that
+  bool buttonState = digitalRead(joyButton);
+
+  // Check for button release
+  if (buttonState == HIGH && lastState == LOW) {
+    lastState = HIGH;
+    buzzer(clickable);  // Play sound based on clickable state
+    return true;
+  }
+
+  lastState = buttonState;
+  return false;
+}
+
+void executeSelectedMode() {
+  char buffer[20];
+  strcpy_P(buffer, menuOptions[selectedMode]);
+  lcd.clear();
+
+  switch (selectedMode) {
+    case 0:
+      randomPathMode();
+      break;
+    case 1:
+      quietMode();
+      break;
+    case 2:
+      sleepMode();
+      break;
+    case 3:
+      setBoundaries();
+      break;
+    case 4:
+      scheduleMode();
+      break;
+    case 5:
+      customPathMode();
+      break;
+    case 6:
+      demoMode();
+      break;
+    default:
+      returnToMenu();
+      break;
+  }
+}
+
+void returnToMenu() {
+  digitalWrite(laserPin, LOW);
+  digitalWrite(SleepPin, LOW);
+  currentState = SELECT_MODE;
+  joystickNeutral = true;  // Reset joystick state
+  displayMenu();
+  lastActivity = millis();
+  delay(500);
+}
+
+void enterLowPowerMode() {
+  lcd.clear();
+  lcd.noBacklight();
+  lcdOn = false;
+  currentState = LOW_POWER;
+}
+
+void exitLowPowerMode() {
+  lcd.backlight();
+  lcdOn = true;
+}
+
+void buzzer(bool isClickable) {
+  if (!isQuietModeActivated()) {
+    if (isClickable) {
+      tone(SpeakerPin, 2400, 75);
+    } else {
+      tone(SpeakerPin, 300, 75);
+      delay(125);
+      tone(SpeakerPin, 300, 100);
+    }
+  }
+}
+
+// =========== MODE FUNCTION DEFINITIONS ============
+
+bool randomPathMode(int runTime = 1) {
+  // Code for Pete the Cat
+  lcd.clear();
+  digitalWrite(laserPin, HIGH);
+  if (!isQuietModeActivated()) {
+  }
+  generatePath(50, 20, 20, 150, runTime*60000);  // (int segAmt, int numCurvPts, int numStrtPts, int speed, int stopTime, Point* start = nullptr)
+  digitalWrite(laserPin, LOW);
+  returnToMenu();
+}
+
+bool demoMode() {
+  lcd.clear();
+  digitalWrite(laserPin, HIGH);
+  digitalWrite(SleepPin, HIGH);
+  xStepper.setMaxSpeed(100);
+  for(int i = 0; i < 5; i++){
+    int yPoint = random(yPosRange[0],yPosRange[1]);
+    int xPoint = random(xPosRange[0],xPosRange[1]);
+    moveSteppers(xPoint,yPoint);
+    delay(random(0,1000));
+  }
+  moveSteppers(xCenterPos, yCenterPos);
+  delay(1000);
+  demonstrateShapes(3, 1);  // Start with triangle, run for 1 minute
+  digitalWrite(laserPin, LOW);
+  return;
+}
+
+bool customPathMode() {
+  lcd.clear();
+  lcd.setCursor((16 - strlen_P(PSTR("Custom Path"))) / 2, 0);
+  lcd.print(F("Custom Path"));
+
+  lcd.setCursor(0, 1);
+  for (int i = 0; i < 16; i++) {
+    lcd.print(F(" "));
+  }
+
+  digitalWrite(laserPin, HIGH);
+  if (!isQuietModeActivated()) {
+  }
+  executeCustomPath();
+  digitalWrite(laserPin, LOW);
+
+  returnToMenu();
+  return true;
+}
+
+bool setBoundaries() {
+
+  lcd.clear();
+  lcd.setCursor((16 - strlen_P(PSTR("Set Boundaries"))) / 2, 0);
+  lcd.print(F("Set Boundaries"));
+  bool boundariesSet = false;
+
+  digitalWrite(laserPin, HIGH);
+
+  digitalWrite(SleepPin, HIGH);
+  tempMaxSpeed = 125;
+
+  // Clear the bottom line
+  lcd.setCursor(0, 1);
+  for (int i = 0; i < 16; i++) {
+    lcd.print(F(" "));
+  }
+
+  while (!boundariesSet) {
+    // Read joystick positions
+    int xJoyVal = analogRead(joyXpin);  // Read X-axis
+    int yJoyVal = analogRead(joyYpin);  // Read Y-axis
+
+    // Map joystick values to motor positions
+    int joystickSpeedX = map(xJoyVal, 0, 1023, -tempMaxSpeed, tempMaxSpeed);
+    int joystickSpeedY = map(yJoyVal, 0, 1023, -tempMaxSpeed, tempMaxSpeed);
+
+    if (abs(xJoyVal - 512) < 75) {
+      joystickSpeedX = 0;
+    }
+    if (abs(yJoyVal - 512) < 75) {
+      joystickSpeedY = 0;
+    }
+
+    // Set the speed of the stepper motors
+    xStepper.setSpeed(joystickSpeedX);  // Set speed for xStepper
+    yStepper.setSpeed(joystickSpeedY);  // Set speed for yStepper
+
+    // Move the motors based on the joystick input
+    xStepper.runSpeed();  // Move xStepper at the set speed
+    yStepper.runSpeed();  // Move yStepper at the set speed
+
+    // If the joystick button is pressed, save the current position of the steppers
+    if (isButtonReleased()) {
+      boundariesSet = setFourCorners();
+      delay(100);
+    }
+  }
+  moveSteppers(0, 0);
+  xStepper.setMaxSpeed(1200);  // Set speed for xStepper
+  yStepper.setMaxSpeed(1200);
+  digitalWrite(SleepPin, LOW);
+  digitalWrite(laserPin, LOW);
+  delay(1000);
+  returnToMenu();
+  return true;
+}
+
+bool quietMode() {
+  // Read the current state from EEPROM
+  int eepromValue = EEPROM.read(0);    // Read from the first byte
+  bool isActive = (eepromValue == 1);  // True if activated
+
+  // Toggle the state
+  isActive = !isActive;  // Switch between activated and deactivated
+
+  // Display Quiet Mode
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("Quiet Mode:"));
+
+  // Display Activated or Deactivated
+  lcd.setCursor(0, 1);  // Align to the left
+  if (isActive) {
+    lcd.print(F("Activated   "));
+  } else {
+    lcd.print(F("Deactivated "));
+  }
+  // Write the new state to EEPROM (1 for activated, 0 for deactivated)
+  EEPROM.write(0, isActive ? 1 : 0);
+
+  delay(2000);  // Wait for 2 seconds
+  returnToMenu();
+  return true;
+}
+
+//==========Functions called by the mode functions================
+
+//----------LCD/Logic Functions-----------------
+
+bool sleepMode() {
+  // Implement sleep mode logic
+  enterLowPowerMode();
+  return false;
+}
+
+bool isQuietModeActivated() {
+  // Read the current state from EEPROM
+  int eepromValue = EEPROM.read(0);  // Read from the first byte
+  return (eepromValue == 1);         // Return true if activated, false otherwise
+}
+
+//----------Stepper Functions-----------------
+
+bool homeSteppers(int homeSpeed = 100) {  // Defaults to 100
+  static int lastProgress = 0;  // Static variable to remember the last progress bar position
+  static bool screenCleared = false;  // Flag to track if the screen has been cleared
+
+  digitalWrite(SleepPin, HIGH);
+
+  // Only clear the screen and initialize progress bar if a new speed is received
+  if (homeSpeed != 100 || !screenCleared) {
+    lcd.clear();
+    lcd.setCursor((16 - 11) / 2, 0);  // Center the title "The LaserCat"
+    lcd.print(F("The LaserCat"));
+
+    // Initialize empty progress bar
+    lcd.setCursor(0, 1);
+    for (int i = 0; i < 16; i++) {
+      lcd.print(F(" "));
+    }
+
+    // Mark that the screen has been cleared
+    screenCleared = true;
+
+    // Reset progress bar when homeSpeed changes
+    lastProgress = 0;
+  }
+
+  // Start homing process in the background
+  int xIR_anaValue = 1000;
+  int yIR_anaValue = 1000;
+  int homingTol = 80;
+  long nextPos = 0;
+  int increment = -10;
+  bool xHomed = false;
+  bool yHomed = false;
+  int totalSteps = 2;         // Total steps for homing (X and Y axes)
+  int completedSteps = 0;     // Completed steps count
+  int progressBarLength = lastProgress;  // Track progress, start from the last progress point
+  unsigned long startTime = millis();
+  unsigned long endTime = startTime + 5000;  // 5 seconds timeout for progress bar
+
+  delay(200);
+
+  xStepper.setSpeed(600);  // Send steppers to consistent starting position to increase repeatability
+  yStepper.setSpeed(600);
+  moveSteppers(-150, -150);  // Change this for homing offset
+
+  // Track if the progress bar has started
+  bool progressBarStarted = false;
+
+  while (millis() < endTime) {
+    // Only start the progress bar once (if it hasn't started yet)
+    if (!progressBarStarted) {
+      progressBarStarted = true;
+    }
+
+    // Calculate progress for a fixed 5-second duration based on time elapsed
+    int progress = map(millis() - startTime, 0, 5000, 0, 16);  // Map elapsed time to progress bar length
+
+    // If the speed is still 100, continue from the last progress value
+    if (homeSpeed == 100) {
+      progress = lastProgress + (millis() - startTime) / 1000;  // Increment in a smooth manner over time
+    }
+
+    // Update the progress bar
+    if (progress > progressBarLength) {
+      for (int i = progressBarLength; i < progress; i++) {
+        lcd.setCursor(i, 1);  // Move cursor to the correct position
+        lcd.write(byte(255));  // Full block
+      }
+      progressBarLength = progress;
+      lastProgress = progress;  // Store the last progress value
+    }
+
+    // Run homing process in the background (coarse adjustment)
+    xIR_anaValue = analogRead(xIR_anaPin);
+    yIR_anaValue = analogRead(yIR_anaPin);
+
+    // Move x motor if not yet homed
+    if (!xHomed) {
+      nextPos = xStepper.currentPosition() + increment;
+      while (xStepper.currentPosition() > nextPos) {
+        xStepper.setSpeed(-homeSpeed);
+        xStepper.runSpeed();  // Move the motor
+      }
+      xStepper.stop();
+
+      // Update IR sensor readings
+      xIR_anaValue = analogRead(xIR_anaPin);
+
+      // Check if X IR sensor is within homing tolerance
+      if (xIR_anaValue <= homingTol) {
+        delay(20);                              // Small delay to debounce
+        xIR_anaValue = analogRead(xIR_anaPin);  // Read again to confirm
+        if (xIR_anaValue <= 300) {         // Check if sensor value is below threshold
+          xStepper.setCurrentPosition(0);  // Homing complete for X
+          xHomed = true;
+          completedSteps++;  // Increment completed steps
+        }
+      }
+    }
+
+    // Move y motor if not yet homed
+    if (!yHomed) {
+      nextPos = yStepper.currentPosition() + increment;
+      while (yStepper.currentPosition() > nextPos) {
+        yStepper.setSpeed(-homeSpeed);
+        yStepper.runSpeed();
+      }
+      yStepper.stop();
+
+      yIR_anaValue = analogRead(yIR_anaPin);
+
+      // Check if Y IR sensor is within homing tolerance
+      if (yIR_anaValue <= homingTol) {
+        delay(20);                              // Small delay to debounce
+        yIR_anaValue = analogRead(yIR_anaPin);  // Read again to confirm
+        if (yIR_anaValue <= 300) {         // Check if sensor value is below threshold
+          yStepper.setCurrentPosition(0);  // Homing complete for Y
+          yHomed = true;
+          completedSteps++;  // Increment completed steps
+        }
+      }
+    }
+
+    // If homing is complete, break out of loop
+    if (xHomed && yHomed) {
+      break;
+    }
+  }
+
+  // If homing did not complete within the time limit, show error message
+  if (!(xHomed && yHomed)) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(F("Error Homing"));
+    digitalWrite(SleepPin, LOW);  // Stop the motors
+    return false;
+  }
+
+  // Continue with further actions after homing
+  xyPos[0] = 360;  // Homing Offset
+  xyPos[1] = 280;  // Homing Offset
+  bothSteppers.moveTo(xyPos);
+  bothSteppers.runSpeedToPosition();
+
+  xStepper.setCurrentPosition(0);
+  yStepper.setCurrentPosition(0);
+
+  xyPos[0] = xCenterPos;  // Center position
+  xyPos[1] = yCenterPos;  // Center position
+  bothSteppers.moveTo(xyPos);
+  bothSteppers.runSpeedToPosition();
+
+  digitalWrite(SleepPin, LOW);  // Disable stepper driver sleep mode if necessary
+  return true;
+}
+
+void setMicrostepping(int microsteps) {
+  // Implement microstepping configuration
+}
+
+// Read joystick and set position based on it
+void setPosToJoy() {
+  // Feel free to use this, it's basically from the ME115 joystick code
+  // Read joystick positions
+  int xJoyVal = analogRead(joyXpin);  // Read X-axis
+  int yJoyVal = analogRead(joyYpin);  // Read Y-axis
+
+  // Map joystick values to motor positions
+  xyPos[0] = map(xJoyVal, 0, 1023, xPosRange[0], xPosRange[1]);  // Map X-axis
+  xyPos[1] = map(yJoyVal, 0, 1023, yPosRange[0], yPosRange[1]);  // Map Y-axis
+
+  bothSteppers.moveTo(xyPos);
+  bothSteppers.run();
+  delay(1);
+}
+
+//---------Random Path Functions---------
+
+// Function to display cat levels and names
+
+bool executeCustomPath() {
+  digitalWrite(SleepPin, HIGH);  // Active low: sleeps when set to low
+  lcd.clear();
+  lcd.print(F("  Draw a Path!"));
+  lcd.setCursor(0, 1);
+  lcd.print(F(" Click to Exit."));
+  tempMaxSpeed = 200;
+
+  while (!isButtonReleased()) {  //Change this so it can exit this part
+    // Read the joystick position
+    int xJoyVal = analogRead(joyXpin);
+    int yJoyVal = analogRead(joyYpin);
+
+    // Map the joystick values (0-1023) to a speed range for the stepper motors
+    int joystickSpeedX = map(xJoyVal, 0, 1023, -tempMaxSpeed, tempMaxSpeed);  // Speed based on X-axis
+    int joystickSpeedY = map(yJoyVal, 0, 1023, -tempMaxSpeed, tempMaxSpeed);  // Speed based on Y-axis
+    // Look into nonlinear mapping.
+
+    if (abs(xJoyVal - 512) < 75) {
+      joystickSpeedX = 0;
+      if (outOfBounds()) {
+        moveSteppers(xCenterPos, yCenterPos);
+      }
+    }
+    if (abs(yJoyVal - 512) < 75) {
+      joystickSpeedY = 0;
+      if (outOfBounds()) {
+        moveSteppers(xCenterPos, yCenterPos);
+      }
+    }
+
+    // Set the speed of the stepper motors
+    xStepper.setSpeed(joystickSpeedX);  // Set speed for xStepper
+    yStepper.setSpeed(joystickSpeedY);  // Set speed for yStepper
+
+    // Move the motors based on the joystick input
+    xStepper.runSpeed();  // Move xStepper at the set speed
+    yStepper.runSpeed();  // Move yStepper at the set speed
+  }
+  moveSteppers(0, 0);
+  digitalWrite(SleepPin, LOW);  // Active low: sleeps when set to low
+  return true;
+}
+
+bool outOfBounds() {
+  if (xStepper.currentPosition() < xPosRange[0] || xStepper.currentPosition() > xPosRange[1]) {
+    return true;
+  } else if (yStepper.currentPosition() < yPosRange[0] || yStepper.currentPosition() > yPosRange[1]) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+//====================Set Boundaries functions
+
+bool setFourCorners() {
+  // Save the current position of the stepper motors when the button is pressed
+  savedPositions[pressCount][0] = xStepper.currentPosition();  // Save X position
+  savedPositions[pressCount][1] = yStepper.currentPosition();  // Save Y position
+  
+  // Increment the press count
+  pressCount++;
+
+  // After 4 button presses, calculate the boundaries of the square
+  if (pressCount == 4) {
+    // Initialize the min/max variables
+    int xMin1 = 5000, xMin2 = 5000;
+    int xMax1 = -5000, xMax2 = -5000;
+    int yMin1 = 5000, yMin2 = 5000;
+    int yMax1 = -5000, yMax2 = -5000;
+
+    // Find the first and second smallest/largest for X and Y
+    for (int i = 0; i < 4; i++) {
+      int x = savedPositions[i][0];
+      int y = savedPositions[i][1];
+
+      // Update first and second smallest X
+      if (x < xMin1) {
+        xMin2 = xMin1;
+        xMin1 = x;
+      } else if (x < xMin2) {
+        xMin2 = x;
+      }
+
+      // Update first and second largest X
+      if (x > xMax1) {
+        xMax2 = xMax1;
+        xMax1 = x;
+      } else if (x > xMax2) {
+        xMax2 = x;
+      }
+
+      // Update first and second smallest Y
+      if (y < yMin1) {
+        yMin2 = yMin1;
+        yMin1 = y;
+      } else if (y < yMin2) {
+        yMin2 = y;
+      }
+
+      // Update first and second largest Y
+      if (y > yMax1) {
+        yMax2 = yMax1;
+        yMax1 = y;
+      } else if (y > yMax2) {
+        yMax2 = y;
+      }
+    }
+
+    // Assign the second smallest/largest values to boundaries
+    xPosRange[0] = xMin2;  // Second smallest X
+    xPosRange[1] = xMax2;  // Second largest X
+    yPosRange[0] = yMin2;  // Second smallest Y
+    yPosRange[1] = yMax2;  // Second largest Y
+
+    xCenterPos = (xPosRange[0] + xPosRange[1]) / 2;
+    yCenterPos = (yPosRange[0] + yPosRange[1]) / 2;
+
+    // Reset press count for next round of boundary setting
+    pressCount = 0;
+    lcd.clear();
+    lcd.print(F("Boundaries Set!"));
+    return true;
+  } else {
+    return false;
+  }
+}
+
+//==================Generate Random Path===========================
+void generatePath(int segAmt, int numCurvPts, int numStrtPts, int baseSpeed, int stopTime, Point* start = nullptr) {
+  // Constants for path generation
+  digitalWrite(SleepPin, HIGH);  // Active low: sleeps when set to low
+
+  lcd.clear();
+  lcd.print(F("Click to Exit"));
+
+  const int SEGMENT_AMOUNT = segAmt;           // Number of segments in the path
+  const int NUM_CURVE_POINTS = numCurvPts;     // Number of points for curved segments
+  const int NUM_STRAIGHT_POINTS = numStrtPts;  // Number of points for the final straight segment
+
+  // Calculate the amplitude and offset for speed fluctuation
+  speedAmplitude = baseSpeed * 0.5;  // 80% of baseSpeed for larger fluctuations
+  speedOffset = baseSpeed;     // Center the fluctuation lower at 70% of baseSpeed
+
+  xStepper.setMaxSpeed(baseSpeed);
+  yStepper.setMaxSpeed(baseSpeed);
+
+  startPosition = start ? *start : generateRandomPoint();
+
+  currentTarget = generateRandomPoint();
+
+  currentCenter = {
+    (startPosition.x + currentTarget.x) / 2.0,
+    (startPosition.y + currentTarget.y) / 2.0
+  };
+
+  generateStraightLine(startPosition, currentCenter, NUM_STRAIGHT_POINTS);
+  int startTime = millis();
+  stopTime = millis() + startTime;
+  while (millis()<stopTime) {
+    for (int seg = 0; seg < SEGMENT_AMOUNT; ++seg) {
+      Point nextTarget = generateRandomPoint();
+      Point nextCenter = {
+        (currentTarget.x + nextTarget.x) / 2.0,
+        (currentTarget.y + nextTarget.y) / 2.0
+      };
+
+      // Generate fluctuation using a stronger sinusoidal pattern
+      float time = (float)seg / SEGMENT_AMOUNT;
+      float fluctuation = sin(time * TWO_PI);  // Basic sine wave fluctuation
+      float randomFactor = random(50, 200) / 100.0; // Random factor (50% to 200%) added for more variability
+      if(fluctuation <-0.8){
+        fluctuation = -0.8 + randomFactor/10;
+      }
+      float currentSpeed = speedAmplitude * fluctuation*randomFactor + speedOffset;
+
+      xStepper.setMaxSpeed(currentSpeed);
+      yStepper.setMaxSpeed(currentSpeed);
+
+      // Generate a curve from currentCenter to nextCenter using currentTarget as the control point
+      generateCurve(currentCenter, nextCenter, currentTarget, NUM_CURVE_POINTS);
+      currentTarget = nextTarget;
+      currentCenter = nextCenter;
+
+      if (isButtonReleased()) {
+        // Wait for the joystick button to be clicked to stop
+        lcd.clear();
+        lcd.print(F("Exiting Path"));
+        delay(500);
+
+        xStepper.setMaxSpeed(1200);
+        yStepper.setMaxSpeed(1200);
+        moveSteppers(0, 0);
+        digitalWrite(SleepPin, LOW);
+        return;
+      }
+    }
+
+    // Repeat the path generation loop continuously
+    generateStraightLine(currentCenter, currentTarget, NUM_STRAIGHT_POINTS);
+  }
+}
+
+Point generateRandomPoint() {
+  // Generate a random point within defined boundaries
+  Point p;
+  p.x = static_cast<float>(random(xPosRange[0], xPosRange[1] + 1));  // Random X coordinate
+  p.y = static_cast<float>(random(yPosRange[0], yPosRange[1] + 1));  // Random Y coordinate
+  return p;                                                          // Return the generated point
+}
+
+void generateStraightLine(const Point& start, const Point& end, int numPoints) {
+  // Generate points for a straight line from start to end
+  for (int i = 0; i <= numPoints; ++i) {
+    float t = (float)i / numPoints;             // Calculate parameter t as float
+    int x = start.x + t * (end.x - start.x);   // Interpolate X coordinate
+    int y = start.y + t * (end.y - start.y);   // Interpolate Y coordinate
+    moveSteppers(x, y);
+  }
+}
+
+void generateCurve(const Point& start, const Point& end, const Point& control, int numPoints) {
+  // Generate points for a quadratic Bezier curve defined by start, end, and control points
+  for (int i = 0; i <= numPoints; ++i) {
+    float t = (float)i / numPoints;  // Calculate parameter t as float
+    // Calculate the curve point using the Bézier formula
+    float x = pow(1 - t, 2) * start.x + 2 * (1 - t) * t * control.x + pow(t, 2) * end.x;
+    float y = pow(1 - t, 2) * start.y + 2 * (1 - t) * t * control.y + pow(t, 2) * end.y;
+    moveSteppers(x, y);
+  }
+}
+
+void moveSteppers(long x, long y) {
+  xyPos[0] = x;
+  xyPos[1] = y;
+
+  bothSteppers.moveTo(xyPos);
+  bothSteppers.runSpeedToPosition();
+}
+
+//====================CRAZY STEPPER MODE=================
+void generatePolygonPoints(int numSides, int radius, Point* points) {
+  for (int i = 0; i < numSides; i++) {
+    float angle = i * 2 * M_PI / numSides;
+    points[i].x = cos(angle) * radius + xCenterPos;
+    points[i].y = sin(angle) * radius + yCenterPos;
+  }
+}
+
+bool drawRegularPolygon(int numSides, int baseSpeed, unsigned long endTime) {
+  digitalWrite(SleepPin, HIGH);  // Enable steppers for movement
+
+  // Set acceleration for smooth changes
+  xStepper.setAcceleration(500);
+  yStepper.setAcceleration(500);
+  xStepper.setMaxSpeed(baseSpeed);
+  yStepper.setMaxSpeed(baseSpeed);
+
+  int radius = 20;
+  Point points[6];  // Static array with maximum size
+  generatePolygonPoints(numSides, radius, points);
+
+  int currentPoint = 0;
+  unsigned long lastUpdate = millis();
+  const unsigned long updateInterval = 1;
+
+  moveSteppers(points[0].x, points[0].y);
+
+  while (millis() < endTime) {
+    unsigned long currentTime = millis();
+
+    if (currentTime - lastUpdate >= updateInterval) {
+      int nextPoint = (currentPoint + 1) % numSides;
+
+      Point currentPos = {
+        (float)xStepper.currentPosition(),
+        (float)yStepper.currentPosition()
+      };
+
+      float dx = points[nextPoint].x - currentPos.x;
+      float dy = points[nextPoint].y - currentPos.y;
+      float distance = sqrt(dx * dx + dy * dy);
+
+      if (distance < 0.5) {
+        currentPoint = nextPoint;
+      }
+
+      if (distance > 0) {
+        float xSpeed = (dx / distance) * baseSpeed;
+        float ySpeed = (dy / distance) * baseSpeed;
+
+        xStepper.setSpeed(xSpeed);
+        yStepper.setSpeed(ySpeed);
+      }
+
+      lastUpdate = currentTime;
+    }
+
+    xStepper.runSpeed();
+    yStepper.runSpeed();
+
+    if (isButtonReleased()) {
+      xStepper.stop();
+      yStepper.stop();
+      digitalWrite(laserPin, LOW);
+      lcd.clear();
+      lcd.print("Path Interrupted");
+      delay(500);
+      returnToMenu();
+      return true;
+    }
+  }
+  return false;
+}
+
+void demonstrateShapes(int startSides, int duration) {
+  int currentSides = startSides;
+  unsigned long startTime = millis();
+  unsigned long lastShapeChange = startTime;
+  duration = duration*60000; //Seconds
+
+  while (millis() - startTime < duration) {
+    // Update LCD with current shape info
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Sides: ");
+    lcd.print(currentSides);
+
+    // Calculate when this shape should end
+    unsigned long shapeEndTime = lastShapeChange + 2000;
+
+    // Draw the current shape
+    digitalWrite(laserPin, HIGH);
+    bool exit = drawRegularPolygon(currentSides, 1200, shapeEndTime);
+    if(isButtonReleased() || exit){
+          returnToMenu();
+          return;
+    }
+    // Move to next shape
+    currentSides++;
+    if (currentSides > 6) {
+      drawSquareSpiral(50, 1, false);  //sf = scale factor, works good at 1
+      if(isButtonReleased()){
+          returnToMenu();
+          return;
+      }
+      bounceSteppers();
+      if(isButtonReleased()){
+          returnToMenu();
+          return;
+      }
+      drawSquareSpiral(80, 1, true);  //spirals
+      if(isButtonReleased()){
+          returnToMenu();
+          return;
+      }
+      drawCircleSpiral(20, 1, true);  //spirals
+      if(isButtonReleased()){
+          returnToMenu();
+          return;
+      }
+      currentSides = 3;               // Reset back to triangle
+    }
+
+    lastShapeChange = millis();
+    moveSteppers(0, 0);
+  }
+
+  digitalWrite(laserPin, LOW);
+  digitalWrite(SleepPin, LOW);
+}
+
+void drawSquareSpiral(int numSquares, int sf, bool spiral) {
+  digitalWrite(microstepPin, HIGH);  // Set to 1/2 stepping for faster motion
+
+  tempMaxSpeed = 1000;
+  float scaleFactor = 1.0 * sf;
+  // Calculate sinusoidal scaling factor to grow/shrink square size
+
+  int numPoints = numSquares * 4 * 1;     // 4 lines per square
+  for (int i = 0; i < numSquares; i++) {  // Draw this many full squares
+    if (spiral) {
+      scaleFactor = 0.5 + 0.5 * sin((2 * PI / 5000.0) * millis());  // Oscillates between 0 and 1
+    }
+    for (int j = numPoints; j > 0; j--) {  // Draw each side of the square
+      if (j > 3 * numPoints / 4) {
+        // Rightward (positive x)
+        xStepper.setSpeed(tempMaxSpeed * scaleFactor);
+        yStepper.setSpeed(0);
+      } else if (j <= 3 * numPoints / 4 && j > numPoints / 2) {
+        // Upward (positive y)
+        xStepper.setSpeed(0);
+        yStepper.setSpeed(tempMaxSpeed * scaleFactor);
+      } else if (j <= numPoints / 2 && j > numPoints / 4) {
+        // Leftward (negative x)
+        xStepper.setSpeed(-tempMaxSpeed * scaleFactor);
+        yStepper.setSpeed(0);
+      } else if (j <= numPoints / 4 && j > 0) {
+        // Downward (negative y)
+        xStepper.setSpeed(0);
+        yStepper.setSpeed(-tempMaxSpeed * scaleFactor);
+      }
+
+      xStepper.runSpeed();
+      yStepper.runSpeed();
+      delayMicroseconds(200);
+    }
+  }
+}
+
+void drawCircleSpiral(long numCircles, int sf, bool spiral) {
+  digitalWrite(microstepPin, HIGH);  // Set to 1/2 stepping for faster motion
+
+  long tempMaxSpeed = 1200;   // Maximum speed
+  int pointsPerCircle = 360;  // Number of points in one circle
+  float scaleFactor = 1.0 * sf;
+
+  for (int i = 0; i < numCircles; i++) {
+    for (int j = 0; j < pointsPerCircle; j++) {
+      // Calculate the angle for this point
+      float angle = j * (360.0 / pointsPerCircle);  // Angle in degrees
+
+      // ** New: Calculate the scaling factor for radius over time (sinusoidal growth and shrinkage) **
+      if (spiral) {
+        scaleFactor = 0.5 + 0.5 * sin((2 * PI / 5000.0) * millis());  // Scales between 0 and 1
+      }
+
+      // Set speeds for the stepper motors, with the radius scaled by scaleFactor
+      xStepper.setSpeed(cos(angle * (PI / 180.0)) * tempMaxSpeed * scaleFactor);
+      yStepper.setSpeed(sin(angle * (PI / 180.0)) * tempMaxSpeed * scaleFactor);
+
+      // Run steppers for one point
+      xStepper.runSpeed();
+      yStepper.runSpeed();
+    }
+  }
+}
+
+void bounceSteppers() {
+  digitalWrite(microstepPin, HIGH);  // Set to 1/2 stepping for faster motion
+
+  for (int i = 0; i < 1; i++) {
+    for (int h = 0; h < 30; h++) {      // Move right (slower horizontal movement)
+      xStepper.setSpeed(25);            // Slow rightward motion
+      for (int v = 0; v < 2000; v++) {  // Vertical line up (4x taller)
+        yStepper.setSpeed(1000);
+        xStepper.runSpeed();
+        yStepper.runSpeed();
+      }
+      for (int v = 0; v < 2000; v++) {  // Vertical line down (4x taller)
+        yStepper.setSpeed(-1000);
+        xStepper.runSpeed();
+        yStepper.runSpeed();
+      }
+    }
+
+    for (int h = 0; h < 30; h++) {      // Move left (slower horizontal movement)
+      xStepper.setSpeed(-25);           // Slow leftward motion
+      for (int v = 0; v < 2000; v++) {  // Vertical line up (4x taller)
+        yStepper.setSpeed(1000);
+        xStepper.runSpeed();
+        yStepper.runSpeed();
+      }
+      for (int v = 0; v < 2000; v++) {  // Vertical line down (4x taller)
+        yStepper.setSpeed(-1000);
+        xStepper.runSpeed();
+        yStepper.runSpeed();
+      }
+    }
+  }
+}
+
+void printToLCD(int row, const __FlashStringHelper* message, int col = 0) {
+    lcd.setCursor(col, row);
+    lcd.print(message);
+}
+
+void printToLCD(int row, const char* message, int col = 0) {
+    lcd.setCursor(col, row);
+    lcd.print(message);
+}
+
+void printToLCD(int row, int value, int col = 0) {
+    lcd.setCursor(col, row);
+    lcd.print(value);
+}
+
+void clearLCDRow(int row) {
+    lcd.setCursor(0, row);
+    lcd.print(F("                "));
+}
+
+bool scheduleMode() {
+    lcd.clear();
+    printToLCD(0, F("Schedule a path"));
+    printToLCD(1, F("Please wait..."));
+    delay(1000);
+    
+    // Select the path (Random or Demo)
+    const char* pathOptions[] = {"Random", "Demo"};
+    int pathIndex = 0;
+    
+    lcd.clear();
+    printToLCD(0, F("Select Path:"));
+    printToLCD(1, pathOptions[pathIndex]);
+    
+    while (true) {
+        String direction = getJoystickDirection();
+        if (direction == "Down" || direction == "Up") {
+            pathIndex = (pathIndex + (direction == "Down" ? 1 : -1) + 2) % 2;
+            clearLCDRow(1);
+            printToLCD(1, pathOptions[pathIndex]);
+        } else if (direction == "Right") {
+            returnToMenu();
+            return false;
+        } else if (isButtonReleased()) {
+            break;
+        }
+        delay(200); // Debounce delay
+    }
+    
+    // Enter the wait time
+    const int waitTimes[] = {1, 3, 5, 10, 15, 20, 30, 45, 60};
+    int waitIndex = 0;
+    
+    lcd.clear();
+    printToLCD(0, F("Wait time (min):"));
+    printToLCD(1, waitTimes[waitIndex]);
+    lcd.print(F(" min"));
+    
+    while (true) {
+        String direction = getJoystickDirection();
+        if (direction == "Down" || direction == "Up") {
+            waitIndex = (waitIndex + (direction == "Down" ? 1 : -1) + 9) % 9;
+            clearLCDRow(1);
+            printToLCD(1, waitTimes[waitIndex]);
+            lcd.print(F(" min"));
+        } else if (direction == "Right") {
+            returnToMenu();
+            return false;
+        } else if (isButtonReleased()) {
+            break;
+        }
+        delay(200);
+    }
+    
+    int waitTime = waitTimes[waitIndex];
+    
+    // Enter the run time
+    const int runTimes[] = {1, 2, 3, 4, 5};
+    int runIndex = 0;
+    
+    lcd.clear();
+    printToLCD(0, F("Run time (min):"));
+    printToLCD(1, runTimes[runIndex]);
+    lcd.print(F(" min"));
+    
+    while (true) {
+        String direction = getJoystickDirection();
+        if (direction == "Down" || direction == "Up") {
+            runIndex = (runIndex + (direction == "Down" ? 1 : -1) + 5) % 5;
+            clearLCDRow(1);
+            printToLCD(1, runTimes[runIndex]);
+            lcd.print(F(" min"));
+        } else if (direction == "Right") {
+            returnToMenu();
+            return false;
+        } else if (isButtonReleased()) {
+            break;
+        }
+        delay(200);
+    }
+    
+    int runTime = runTimes[runIndex];
+    
+    // Wait for the wait time, then execute path
+    unsigned long startTime = millis();
+    unsigned long waitMillis = (unsigned long)waitTime * 60000;
+    enterLowPowerMode();
+    
+    while (millis() - startTime < waitMillis) {
+        if (isButtonReleased()) {
+            exitLowPowerMode();
+            lcd.clear();
+            printToLCD(0, F("Click to Exit"));
+            delay(700);
+            for(int i =0; i<50; i++){
+                delay(500);
+                if (isButtonReleased()) {
+                    returnToMenu();
+                    return false;
+                }
+            }
+        }
+    }
+    
+    exitLowPowerMode();
+    
+    // Execute the selected path
+    if (pathIndex == 0) {
+        randomPathMode(runTime);
+    } else {
+        demonstrateShapes(3, runTime);
+    }
+    
+    returnToMenu();
+    return true;
+}

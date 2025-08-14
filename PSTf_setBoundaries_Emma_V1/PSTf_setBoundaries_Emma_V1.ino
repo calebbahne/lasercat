@@ -1,0 +1,130 @@
+#include <AccelStepper.h>
+#include <MultiStepper.h>
+
+// Define the pins for the joystick and servo
+const int joyXpin = A2; //analog pins
+const int joyYpin = A3;
+const int joyButton = 13; // Button pin for saving position
+
+// Define variables for joystick readings
+int xJoyVal = 0; //initializes x value to be 0
+int yJoyVal = 0; //initializes y value to be 0
+int buttonState = 0; // To store button press state
+
+// Define stepper motor pins
+const int xDirPin = 2;
+const int xStepPin = 3;
+
+const int yDirPin = 5;
+const int yStepPin = 6;
+const int SleepPin = 4;
+const int microstepPin = 7;
+
+// Joystick position range
+int xPosRange[2] = {-180, 180};
+int yPosRange[2] = {-180, 180};
+long xyPos[2] = {0, 0}; // Stores the positions [x, y] for the two motors
+
+// Create stepper objects
+AccelStepper xStepper(AccelStepper::DRIVER, xStepPin, xDirPin);
+AccelStepper yStepper(AccelStepper::DRIVER, yStepPin, yDirPin);
+MultiStepper bothSteppers;
+
+// Variables to store the saved stepper positions (4 points)
+long savedPositions[4][2]; // Array to store 4 positions: [0] = X, [1] = Y
+int pressCount = 0; // Count of button presses
+
+// Variables to define the square boundary
+long xMin = -180;
+long xMax = 180;
+long yMin = -180;
+long yMax = 180;
+
+float absMaxSpeed = 1200;//Remove if maxed out of variables
+float speedSF = 1;
+float tempMaxSpeed = speedSF*absMaxSpeed;
+
+void setup() {
+  // Initialize stepper motors
+  xStepper.setMaxSpeed(1200);
+  yStepper.setMaxSpeed(1200);
+
+  bothSteppers.addStepper(xStepper);
+  bothSteppers.addStepper(yStepper);
+
+  digitalWrite(SleepPin, HIGH);  //Active low: sleeps when set to low
+  digitalWrite(microstepPin, HIGH); //High for 1/16, low for 1/2 microstepping
+  
+  Serial.begin(9600);
+}
+
+void loop() {
+  // Read joystick positions
+  xJoyVal = analogRead(joyXpin); // Read X-axis
+  yJoyVal = analogRead(joyYpin); // Read Y-axis
+
+  // Map joystick values to motor positions
+  xyPos[0] = map(xJoyVal, 0, 1023, xPosRange[0], xPosRange[1]); // Map X-axis
+  xyPos[1] = map(yJoyVal, 0, 1023, yPosRange[0], yPosRange[1]); // Map Y-axis
+
+  // Move both stepper motors
+  bothSteppers.moveTo(xyPos);
+  bothSteppers.run();
+
+  // Read the joystick button state
+  buttonState = digitalRead(joyButton);
+
+  // If the joystick button is pressed, save the current position of the steppers
+  if (buttonState == LOW) {
+    setBoundaries();
+  }
+
+  delay(1); // Small delay for stability
+}
+
+// Function to save the current stepper positions and define square boundaries
+void setBoundaries() {
+  // Save the current position of the stepper motors when the button is pressed
+  savedPositions[pressCount][0] = xStepper.currentPosition();  // Save X position
+  savedPositions[pressCount][1] = yStepper.currentPosition();  // Save Y position
+  
+  // Print saved position to Serial Monitor
+  Serial.print("Saved Position ");
+  Serial.print(pressCount + 1);
+  Serial.print(": X=");
+  Serial.print(savedPositions[pressCount][0]);
+  Serial.print(", Y=");
+  Serial.println(savedPositions[pressCount][1]);
+
+  // Increment the press count
+  pressCount++;
+
+  // After 4 button presses, calculate the boundaries of the square
+  if (pressCount == 4) {
+    // Find the min and max X and Y values from the saved positions
+    xMin = xMax = savedPositions[0][0];
+    yMin = yMax = savedPositions[0][1];
+
+    // Loop through the saved positions and calculate the min/max
+    for (int i = 1; i < 4; i++) {
+      if (savedPositions[i][0] < xMin) xMin = savedPositions[i][0];
+      if (savedPositions[i][0] > xMax) xMax = savedPositions[i][0];
+      if (savedPositions[i][1] < yMin) yMin = savedPositions[i][1];
+      if (savedPositions[i][1] > yMax) yMax = savedPositions[i][1];
+    }
+
+    // Print the final square boundaries to the Serial Monitor
+    Serial.print("Square Boundary Set: ");
+    Serial.print("X Min=");
+    Serial.print(xMin);
+    Serial.print(", X Max=");
+    Serial.print(xMax);
+    Serial.print(", Y Min=");
+    Serial.print(yMin);
+    Serial.print(", Y Max=");
+    Serial.println(yMax);
+
+    // Reset press count for next round of boundary setting
+    pressCount = 0;
+  }
+}
